@@ -1079,19 +1079,90 @@ MediumEditor.extensions = {};
             return false;
         },
 
-        cleanListDOM: function (ownerDocument, element) {
-            if (element.nodeName.toLowerCase() !== 'li') {
-                return;
+        findFirstTextNodeInSelection: function (selection) {
+            if (selection.anchorNode.nodeType === 3) {
+                return selection.anchorNode;
             }
 
-            var list = element.parentElement;
+            var node = selection.anchorNode.firstChild;
 
-            if (list.parentElement.nodeName.toLowerCase() === 'p') { // yes we need to clean up
-                Util.unwrap(list.parentElement, ownerDocument);
+            while (node) {
+                if (selection.containsNode(node, true)) {
+                    if (node.nodeType === 3) {
+                        return node;
+                    } else {
+                        node = node.firstChild;
+                    }
+                } else {
+                    node = node.nextSibling;
+                }
+            }
 
-                // move cursor at the end of the text inside the list
-                // for some unknown reason, the cursor is moved to end of the "visual" line
-                MediumEditor.selection.moveCursor(ownerDocument, element.firstChild, element.firstChild.textContent.length);
+            return null;
+        },
+
+        cleanListDOM: function (ownerDocument, element) {
+            if (element.nodeName.toLowerCase() !== 'li') {
+                if (this.isIE || this.isEdge) {
+                    return;
+                }
+
+                var selection = ownerDocument.getSelection(),
+                    newRange = ownerDocument.createRange(),
+                    oldRange = selection.getRangeAt(0),
+                    startContainer = oldRange.startContainer,
+                    startOffset = oldRange.startOffset,
+                    endContainer = oldRange.endContainer,
+                    endOffset = oldRange.endOffset,
+                    node, newNode, nextNode, moveEndOffset;
+
+                if (element.nodeName.toLowerCase() === 'span') {
+                    // Chrome & Safari unwraps removed li elements into a span
+                    node = element;
+                    moveEndOffset = false;
+                } else {
+                    // FF leaves them as text nodes
+                    node = this.findFirstTextNodeInSelection(selection);
+                    moveEndOffset = startContainer.nodeType !== 3;
+                }
+
+                while (node) {
+                    if (node.nodeName.toLowerCase() !== 'span' && node.nodeType !== 3) {
+                        break;
+                    }
+
+                    if (node.nextSibling && node.nextSibling.nodeName.toLowerCase() === 'br') {
+                        node.nextSibling.remove();
+
+                        if (moveEndOffset) {
+                            endOffset--;
+                        }
+                    }
+
+                    nextNode = node.nextSibling;
+
+                    newNode = ownerDocument.createElement('p');
+                    node.parentNode.replaceChild(newNode, node);
+                    newNode.appendChild(node);
+
+                    node = nextNode;
+                }
+
+                // Restore selection
+                newRange.setStart(startContainer, startOffset);
+                newRange.setEnd(endContainer, endOffset);
+                selection.removeAllRanges();
+                selection.addRange(newRange);
+            } else {
+                var list = element.parentElement;
+
+                if (list.parentElement.nodeName.toLowerCase() === 'p') { // yes we need to clean up
+                    Util.unwrap(list.parentElement, ownerDocument);
+
+                    // move cursor at the end of the text inside the list
+                    // for some unknown reason, the cursor is moved to end of the "visual" line
+                    MediumEditor.selection.moveCursor(ownerDocument, element.firstChild, element.firstChild.textContent.length);
+                }
             }
         },
 
@@ -3217,7 +3288,17 @@ MediumEditor.extensions = {};
             var action = this.getAction();
 
             if (action) {
-                this.execAction(action);
+                if (this.getEditorOption('disableEditing')) {
+                    this.getEditorElements().forEach(function (element) {
+                        element.setAttribute('contentEditable', 'true');
+                    });
+                    this.execAction(action);
+                    this.getEditorElements().forEach(function (element) {
+                        element.setAttribute('contentEditable', 'inherit');
+                    });
+                } else {
+                    this.execAction(action);
+                }
             }
         },
 
@@ -3788,8 +3869,8 @@ MediumEditor.extensions = {};
                 // and provide similar access to a `fa-` icon default.
                 template.push(
                     '<div class="medium-editor-toolbar-form-row">',
-                    '<input type="checkbox" class="medium-editor-toolbar-anchor-button">',
-                    '<label>',
+                    '<input type="checkbox" class="medium-editor-toolbar-anchor-button" id="medium-editor-toolbar-anchor-button-field-' + this.getEditorId() + '">',
+                    '<label for="medium-editor-toolbar-anchor-button-field-' + this.getEditorId() + '">',
                     this.customClassOptionText,
                     '</label>',
                     '</div>'
@@ -5897,6 +5978,15 @@ MediumEditor.extensions = {};
          */
         relativeContainer: null,
 
+        /* supportTouch: [boolean]
+         * When the _supportTouch_ option is true, additional touch-events will be
+         * attached and a new class 'medium-toolbar-touch' will be added. For better user experience
+         * we set the _static_ option also to true. But it is not enough to just enable _supportTouch_.
+         * Additionally, we also check if we're on a real touch device with "isTouchDevice()".
+         * So if isTouchDevice() === true and _supportTouch_ === true -> then we enable touch!
+         */
+        supportTouch: false,
+
         init: function () {
             MediumEditor.Extension.prototype.init.apply(this, arguments);
 
@@ -5906,6 +5996,11 @@ MediumEditor.extensions = {};
                 this.getEditorOption('elementsContainer').appendChild(this.getToolbarElement());
             } else {
                 this.relativeContainer.appendChild(this.getToolbarElement());
+            }
+
+            if (this.isTouchDevice() && typeof arguments['static'] === 'undefined') {
+                // Always make static when we're on a real touch device (smartphones, tablets)
+                this.static = true;
             }
         },
 
@@ -5933,6 +6028,10 @@ MediumEditor.extensions = {};
                 toolbar.className += ' medium-editor-relative-toolbar';
             } else {
                 toolbar.className += ' medium-editor-stalker-toolbar';
+            }
+
+            if (this.isTouchDevice()) {
+                toolbar.className += ' touch-toolbar';
             }
 
             toolbar.appendChild(this.createToolbarButtons());
@@ -6036,6 +6135,8 @@ MediumEditor.extensions = {};
             }.bind(this));
         },
 
+        _selectionEndTimer: null,
+
         attachEventHandlers: function () {
             // MediumEditor custom events for when user beings and ends interaction with a contenteditable and its elements
             this.subscribe('blur', this.handleBlur.bind(this));
@@ -6047,6 +6148,21 @@ MediumEditor.extensions = {};
 
             // Handle mouseup on document for updating the selection in the toolbar
             this.on(this.document.documentElement, 'mouseup', this.handleDocumentMouseup.bind(this));
+
+            // Check if we are on real touch device and attach touch-event if so
+            if (this.isTouchDevice()) {
+                // Support selectionchange: http://stackoverflow.com/questions/15076173/end-of-text-selection-event
+                document.onselectionchange = function (event) {
+                    clearTimeout(this._selectionEndTimer);
+                    this._selectionEndTimer = setTimeout(function () {
+                        if (this.isToolbarDefaultActionsDisplayed()) {
+                            this.handleDocumentMouseup(event);
+                        }
+                    }.bind(this), 500);
+                }.bind(this);
+                 // Capture keyboard hide event: http://stackoverflow.com/questions/9819240/how-to-capture-the-hide-keyboard-event-on-ios-using-javascript
+                document.addEventListener('focusout', this.handleBlur.bind(this));
+            }
 
             // Add a scroll event for sticky toolbar
             if (this.static && this.sticky) {
@@ -6494,7 +6610,13 @@ MediumEditor.extensions = {};
             ['top', 'left', 'right'].forEach(function (key) {
                 toolbarElement.style[key] = positions[key] + (isNaN(positions[key]) ? '' : 'px');
             });
-        }
+        },
+
+        isTouchDevice: function () {
+            return ('ontouchstart' in document.documentElement) &&
+                this.supportTouch === true &&
+                navigator.userAgent.indexOf('PhantomJS') === -1;
+        },
     });
 
     MediumEditor.extensions.toolbar = Toolbar;
